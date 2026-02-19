@@ -4,12 +4,15 @@ AI voice concierge for JW Marriott Gold Coast Resort & Spa.
 Handles inbound calls via Twilio with real-time STT, LLM, and TTS.
 """
 
+import asyncio
 import os
+import time
 
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import Frame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -18,6 +21,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -25,6 +29,22 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+
+SILENCE_TIMEOUT_SECS = 30
+
+
+class SilenceTimeoutProcessor(FrameProcessor):
+    """Tracks when the caller last spoke; used by the silence watchdog."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_speech_at: float = time.monotonic()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, TranscriptionFrame):
+            self.last_speech_at = time.monotonic()
+        await self.push_frame(frame, direction)
+
 
 load_dotenv(override=True)
 
@@ -107,7 +127,14 @@ with information, but the front desk team would be happy to help you with that."
 they check with the front desk.
 - Do not use bullet points, numbered lists, or special characters — speak naturally.
 - If the caller seems done, ask if there's anything else they'd like to know about \
-the resort.\
+the resort.
+- STRICT SCOPE: You ONLY answer questions about this resort and its immediate \
+surroundings. If someone asks about anything unrelated — legal advice, medical \
+advice, news, general knowledge, personal situations, other hotels, or anything \
+else outside the resort — do NOT engage with it at all. Simply say: "Sorry, I can \
+only help with questions about the JW Marriott Gold Coast Resort. Is there anything \
+about the resort I can help you with?" Do not offer partial answers, safety tips, \
+or any other content for off-topic questions.\
 """
 
 transport_params = {
@@ -120,6 +147,8 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting Hotel Receptionist bot")
+
+    silence_tracker = SilenceTimeoutProcessor()
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
@@ -150,6 +179,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         [
             transport.input(),
             stt,
+            silence_tracker,
             user_aggregator,
             llm,
             tts,
@@ -167,17 +197,36 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    _watchdog_task: asyncio.Task | None = None
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        nonlocal _watchdog_task
         logger.info("Caller connected")
         # Greeting is spoken by Twilio TwiML <Say> before WebSocket connects
         # Just tell the LLM context what was already said
         greeting = "Hello, thank you for calling the JW Marriott Gold Coast Resort and Spa. How can I help you today?"
         messages.append({"role": "assistant", "content": greeting})
 
+        silence_tracker.last_speech_at = time.monotonic()
+
+        async def _silence_watchdog():
+            while True:
+                await asyncio.sleep(5)
+                if time.monotonic() - silence_tracker.last_speech_at >= SILENCE_TIMEOUT_SECS:
+                    logger.info(f"No caller speech for {SILENCE_TIMEOUT_SECS}s — hanging up")
+                    await task.cancel()
+                    return
+
+        _watchdog_task = asyncio.ensure_future(_silence_watchdog())
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        nonlocal _watchdog_task
         logger.info("Caller disconnected")
+        if _watchdog_task:
+            _watchdog_task.cancel()
+            _watchdog_task = None
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
