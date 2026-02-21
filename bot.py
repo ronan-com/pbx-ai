@@ -6,6 +6,7 @@ Handles inbound calls via Twilio with real-time STT, LLM, and TTS.
 
 import asyncio
 import os
+import sqlite3
 import time
 
 from dotenv import load_dotenv
@@ -47,6 +48,41 @@ class SilenceTimeoutProcessor(FrameProcessor):
 
 
 load_dotenv(override=True)
+
+# Path to the SQLite DB written by the PHP dashboard.
+# Adjust if your db/ directory is in a different location.
+_DB_PATH = os.path.join(os.path.dirname(__file__), "db", "pbx.sqlite")
+
+
+def load_hotel_config(to_number: str) -> dict | None:
+    """Load hotel agent config from the DB by the called phone number.
+
+    Returns a dict with system_prompt, greeting_message, and
+    elevenlabs_voice_id — or None if not found (triggers fallback).
+    """
+    if not to_number or not os.path.exists(_DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT a.system_prompt, a.greeting_message, a.elevenlabs_voice_id
+            FROM agent_settings a
+            JOIN phone_numbers p ON p.hotel_id = a.hotel_id
+            WHERE p.twilio_number = ?
+            """,
+            (to_number,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row["system_prompt"]:
+            return dict(row)
+    except Exception as e:
+        logger.error(f"DB config lookup failed for {to_number}: {e}")
+    return None
+
 
 SYSTEM_PROMPT = """\
 You are the AI concierge at the JW Marriott Gold Coast Resort & Spa. You are \
@@ -145,8 +181,21 @@ transport_params = {
 }
 
 
-async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting Hotel Receptionist bot")
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, to_number: str = None):
+    logger.info(f"Starting Hotel Receptionist bot (to_number={to_number!r})")
+
+    # Load hotel-specific config from DB; fall back to the hardcoded constant.
+    hotel_cfg = load_hotel_config(to_number)
+    if hotel_cfg:
+        logger.info(f"Loaded DB config for {to_number}")
+        system_prompt = hotel_cfg["system_prompt"]
+        greeting      = hotel_cfg["greeting_message"] or "Hello, how can I help you today?"
+        voice_id      = hotel_cfg["elevenlabs_voice_id"] or os.getenv("ELEVENLABS_VOICE_ID", "")
+    else:
+        logger.info("Using hardcoded SYSTEM_PROMPT fallback")
+        system_prompt = SYSTEM_PROMPT
+        greeting      = "Hello, thank you for calling the JW Marriott Gold Coast Resort and Spa. How can I help you today?"
+        voice_id      = os.getenv("ELEVENLABS_VOICE_ID", "")
 
     silence_tracker = SilenceTimeoutProcessor()
 
@@ -154,7 +203,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-        voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+        voice_id=voice_id,
         params=ElevenLabsTTSService.InputParams(
             optimize_streaming_latency=4,
         ),
@@ -166,7 +215,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
     ]
 
     context = LLMContext(messages)
@@ -203,9 +252,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         nonlocal _watchdog_task
         logger.info("Caller connected")
-        # Greeting is spoken by Twilio TwiML <Say> before WebSocket connects
-        # Just tell the LLM context what was already said
-        greeting = "Hello, thank you for calling the JW Marriott Gold Coast Resort and Spa. How can I help you today?"
+        # The greeting audio plays via Twilio TwiML <Play> before the WebSocket
+        # connects. Injecting it here tells the LLM what was already said.
         messages.append({"role": "assistant", "content": greeting})
 
         silence_tracker.last_speech_at = time.monotonic()
@@ -234,9 +282,34 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
 async def bot(runner_args: RunnerArguments):
-    """Main bot entry point."""
+    """Main bot entry point.
+
+    The 'To' number is passed as a query parameter (?to=+61...) in the
+    WebSocket URL that Twilio connects to. Set this in your TwiML response:
+
+        <Connect>
+          <Stream url="wss://yourdomain.com/bot?to=YOUR_TWILIO_NUMBER" />
+        </Connect>
+
+    Pipecat exposes the original request via runner_args; we pull 'to' from
+    query_params if available, then fall back to the env var DEFAULT_HOTEL_NUMBER.
+    """
+    # Try to extract the 'to' number from the WebSocket request query params.
+    to_number = None
+    try:
+        request = getattr(runner_args, "request", None)
+        if request is not None:
+            to_number = request.query_params.get("to")
+    except Exception:
+        pass
+
+    # Fallback: operator can set DEFAULT_HOTEL_NUMBER in .env for single-hotel
+    # deployments or while testing before TwiML is updated.
+    if not to_number:
+        to_number = os.getenv("DEFAULT_HOTEL_NUMBER")
+
     transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport, runner_args)
+    await run_bot(transport, runner_args, to_number=to_number)
 
 
 if __name__ == "__main__":
