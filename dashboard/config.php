@@ -1,12 +1,25 @@
 <?php
-// Twilio API credentials
-define('TWILIO_SID', 'AC93119e48894439bc5c1994f05cc14034');
-define('TWILIO_TOKEN', '2ed77ff5005da561160c4f00db0efee1');
-define('TWILIO_NUMBER', '+61341523627');
-define('TWILIO_NUMBER_SID', 'PN720e1e898d9c5bef58b1fda3a01e1e6c');
+// Infrastructure credentials — read from environment variables.
+// Set these in /etc/environment, your web server config, or a .env file.
+// Do NOT hardcode credentials here.
+define('TWILIO_SID',      getenv('TWILIO_SID')      ?: '');
+define('TWILIO_TOKEN',    getenv('TWILIO_TOKEN')    ?: '');
+define('BOT_WEBHOOK_URL', getenv('BOT_WEBHOOK_URL') ?: '');
 
-// AI Bot webhook URL (ngrok)
-define('BOT_WEBHOOK_URL', 'https://pseudohistorically-unutilitarian-deane.ngrok-free.dev');
+// SQLite database path — must be writable by the web server process.
+define('DB_PATH', __DIR__ . '/../db/pbx.sqlite');
 
-// Hotel info
-define('HOTEL_NAME', 'JW Marriott Gold Coast Resort & Spa');
+/**
+ * Returns a shared PDO connection to the SQLite database.
+ * Creates the DB file on first run if it doesn't exist.
+ */
+function db(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $pdo = new PDO('sqlite:' . DB_PATH);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE,            PDO::ERRMODE_EXCEPTION);
+        $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $pdo->exec('PRAGMA foreign_keys = ON');
+    }
+    return $pdo;
+}
