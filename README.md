@@ -86,35 +86,64 @@ PHP-based management interface for hotel operators:
 
 ## PABX Integration
 
-This section is for PABX system developers integrating AI reception into their platform.
+This section is for PABX/telephony platform developers (e.g. Broadband Solutions) integrating AI reception into their product.
 
-### How It Works Today (Demo)
+### The Core Concept
 
-The demo uses a single Twilio number with a hardcoded webhook. When AI is toggled ON, the dashboard makes one Twilio REST API call to point the number's `VoiceUrl` at the AI bot. Toggle OFF reverts it to the original endpoint.
+When a hotel admin enables AI reception for a phone number, your PABX platform needs to redirect inbound calls for that DID to this AI bot instead of the normal extension. When they disable it, calls revert to the original destination.
 
-This same mechanism is exactly what your PABX backend needs to implement at scale.
+The AI bot's entry point is a **WebSocket endpoint** (`wss://ai-server.example.com/bot`). Your platform needs a way to hand off live call audio to that endpoint. There are two ways to do this depending on your infrastructure:
 
-### Routing Switch — How Selecting a Number Enables AI
+---
 
-When a hotel admin picks a number and enables AI reception, your PABX backend makes a single call to Twilio's REST API to update the SIP routing for that DID:
+### Option A — SIP Forwarding (Recommended if you run your own SIP infrastructure)
 
-**Enable AI for a number:**
+This is the cleanest integration if Broadband Solutions manages its own SIP trunks or softswitch.
+
+**How it works:**
+
 ```
-POST https://api.twilio.com/2010-04-01/Accounts/{ACCOUNT_SID}/IncomingPhoneNumbers/{NUMBER_SID}.json
-Authorization: Basic {base64(ACCOUNT_SID:AUTH_TOKEN)}
-Content-Type: application/x-www-form-urlencoded
-
-VoiceUrl=https://ai-server.example.com/bot
+Hotel admin enables AI for +617XXXXXXXX
+         ↓
+Your PABX backend updates the routing table for that DID:
+  original destination: sip:reception@hotel-pbx.example.com
+  new destination:      sip:ai-reception@ai-sip-bridge.example.com
+         ↓
+Inbound call arrives → PABX routes to AI SIP bridge
+         ↓
+SIP bridge (Asterisk / FreeSWITCH) converts call to WebSocket audio stream
+         ↓
+Pipecat AI pipeline handles the conversation
 ```
 
-**Disable AI (revert to PABX):**
-```
-POST https://api.twilio.com/2010-04-01/Accounts/{ACCOUNT_SID}/IncomingPhoneNumbers/{NUMBER_SID}.json
+**What this requires on our side:** A SIP-capable front-end (Asterisk or FreeSWITCH) that accepts inbound SIP calls and bridges audio to the Pipecat bot via WebSocket. This is a one-time infrastructure addition. The bot itself (`bot.py`) does not change.
 
-VoiceUrl=https://your-pabx.example.com/original-sip-endpoint
+**What your PABX needs to do:**
+- On AI enable: update the DID's inbound route to `sip:ai-reception@<our-sip-server>`
+- On AI disable: restore the original SIP destination
+- Pass the dialled number (`To`) as a SIP header or URI parameter so the bot can load the right hotel's config
+
+---
+
+### Option B — SIP Trunking via Twilio (Current Demo Approach)
+
+If you provision DIDs through Twilio (or want to use Twilio as the SIP-to-WebSocket bridge without running your own Asterisk/FreeSWITCH), the integration is a single Twilio REST API call per number.
+
+**How it works:**
+
+```
+Hotel admin enables AI for a number
+         ↓
+Your backend calls Twilio API to update VoiceUrl for that DID:
+  POST /IncomingPhoneNumbers/{NUMBER_SID}.json
+  VoiceUrl=https://ai-server.example.com/bot
+         ↓
+Twilio opens WebSocket to bot on every inbound call
+         ↓
+To disable: same call with VoiceUrl=<original PBX endpoint>
 ```
 
-**PHP example (for your backend):**
+**PHP example:**
 ```php
 function set_ai_routing(string $number_sid, bool $enable, array $twilio): void {
     $url = "https://api.twilio.com/2010-04-01/Accounts/{$twilio['account_sid']}"
@@ -122,7 +151,7 @@ function set_ai_routing(string $number_sid, bool $enable, array $twilio): void {
 
     $voice_url = $enable
         ? 'https://ai-server.example.com/bot'
-        : $twilio['original_voice_url'];  // stored when AI was first enabled
+        : $twilio['original_voice_url'];  // save this before first enable
 
     $ch = curl_init($url);
     curl_setopt_array($ch, [
@@ -136,51 +165,46 @@ function set_ai_routing(string $number_sid, bool $enable, array $twilio): void {
 }
 ```
 
-**cURL equivalent:**
-```bash
-curl -X POST "https://api.twilio.com/2010-04-01/Accounts/ACXXX/IncomingPhoneNumbers/PNXXX.json" \
-  -u "ACXXX:auth_token" \
-  --data-urlencode "VoiceUrl=https://ai-server.example.com/bot"
-```
+---
 
-That single API call is the entire integration point. Twilio immediately starts routing all inbound calls on that number to the AI bot's WebSocket endpoint.
+### What Your Backend Needs to Store Per Number
 
-### What Your PABX Backend Needs to Store Per Number
+Regardless of which option is used:
 
 | Field | Description |
 |-------|-------------|
-| `twilio_number_sid` | e.g. `PN720e1e898d9c5bef...` — identifies the DID in Twilio |
-| `twilio_account_sid` | Twilio account that owns the number |
-| `twilio_auth_token` | Auth token for that Twilio account |
-| `original_voice_url` | The pre-AI webhook/SIP endpoint — must be saved before first enable so it can be restored on disable |
-| `hotel_id` | Links the number to the hotel's config (knowledge base, voice, etc.) |
-| `ai_enabled` | Boolean — current routing state |
+| `phone_number` | The DID in E.164 format, e.g. `+61741523627` |
+| `original_destination` | SIP URI or webhook URL before AI was enabled — restored on disable |
+| `hotel_id` | Links the number to the hotel's knowledge base and voice config |
+| `ai_enabled` | Boolean — current state |
+
+---
 
 ### Multi-Tenant: One AI Server, Many Hotels
 
-Once AI is enabled for a number, Twilio calls `https://ai-server.example.com/bot` for every inbound call. To serve multiple hotels from one server, the `To` number on each incoming call is used to look up the right hotel config:
+The bot identifies which hotel is calling via the `To` number passed in the WebSocket request. It performs a DB lookup to load that hotel's system prompt, greeting text, and voice:
 
 ```
-Inbound call to +61 7 XXXX XXXX
+Inbound call to +617XXXXXXXX
          ↓
-Bot receives call with To=+617XXXXXXXX
+Bot receives To=+617XXXXXXXX
          ↓
-DB lookup: number → hotel_id → {knowledge_base, voice_id, system_prompt}
+DB lookup: number → hotel_id → {system_prompt, greeting, voice_id}
          ↓
 AI agent initialised with that hotel's config
 ```
 
-The `bot.py` supports this today — it reads the `?to=` query parameter from the WebSocket URL and performs a SQLite lookup to load the hotel's system prompt, greeting, and voice. For your integration, replace the SQLite lookup with a call to your PABX backend API.
+`bot.py` supports this today — it reads `?to=` from the WebSocket URL and queries a local SQLite DB. For your integration, this lookup can be replaced with an API call to your PABX backend.
 
-### Native SIP Integration (No Twilio on the PSTN Leg)
+---
 
-For PABX systems that want to bypass Twilio for the PSTN leg entirely:
+### Questions to Align On
 
-1. The PABX SIP trunk for a DID is updated to route to a SIP server in front of the AI bot (Asterisk, FreeSWITCH, or Twilio SIP Domain)
-2. The SIP server converts the inbound SIP call into the Media Streams WebSocket format Pipecat expects
-3. Your PABX updates the dial peer / outbound route for that DID: `sip:ai-reception@your-sip-proxy.example.com`
+To choose between Option A and Option B and finalise the integration design, we need to know:
 
-This removes Twilio from the call path — only the AI processing (Deepgram, OpenAI, ElevenLabs) remains in the cloud.
+1. **Does Broadband Solutions run its own SIP infrastructure** (softswitch, Asterisk, FreeSWITCH, Kamailio), or do you provision DIDs through a third-party carrier?
+2. **How are inbound call routes currently managed** — config files, a database, a vendor API?
+3. **Is there an existing API** in your PABX platform for updating DID routing programmatically, or would this need to be built?
 
 ---
 
