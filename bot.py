@@ -204,6 +204,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, to_num
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
         voice_id=voice_id,
+        model="eleven_turbo_v2_5",
         params=ElevenLabsTTSService.InputParams(
             optimize_streaming_latency=4,
         ),
